@@ -39,12 +39,12 @@ def inspect_audio(path: Path) -> dict:
 
 
 def prepare(input_dir: Path, output_dir: Path) -> None:
-    if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
-        raise RuntimeError("ffmpeg and ffprobe must be installed and on PATH")
     paths = [input_dir / f"smv_{i:02d}.wav" for i in range(1, COUNT + 1)]
     missing = [p.name for p in paths if not p.is_file()]
     if missing:
         raise FileNotFoundError("Missing *human-recorded* WAV files: " + ", ".join(missing))
+    if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+        raise RuntimeError("ffmpeg and ffprobe must be installed and on PATH")
     # Validate ALL sources before touching the live firmware assets.
     for path in paths:
         info = inspect_audio(path)

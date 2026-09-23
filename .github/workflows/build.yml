@@ -26,6 +26,15 @@ jobs:
       - name: Check out project
         uses: actions/checkout@v4
 
+      - name: Install audio test dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ffmpeg
+          ffmpeg -version
+          ffprobe -version
+
       - name: Run build and voice-only regression tests
         shell: bash
         run: |
