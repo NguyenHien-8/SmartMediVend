@@ -423,7 +423,7 @@ choice BOARD_TYPE
         bool "Seeed Studio SenseCAP Watcher"
         depends on IDF_TARGET_ESP32S3
     config BOARD_TYPE_SMARTMEDIVEND_S3
-        bool "SmartMediVend ESP32-S3 (voice-only, 240x320 TFT)"
+        bool "SmartMediVend ESP32-S3 (voice, relay MUX, 240x320 TFT)"
         depends on IDF_TARGET_ESP32S3
     config BOARD_TYPE_SPOTPEAR_ESP32_S3_1_28_BOX
         bool "Spotpear ESP32-S3 1.28 Box"

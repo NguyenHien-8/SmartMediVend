@@ -156,8 +156,8 @@ void SmartMediVendDisplay::SetupUI() {
                              200, 23, kStatusBlue, font, LV_TEXT_ALIGN_LEFT);
     status_cloud_ = MakeLabel(status_panel_, "Xiaozhi: đang kiểm tra", 8, 77,
                               200, 24, kStatusBlue, font, LV_TEXT_ALIGN_LEFT);
-    status_vending_ = MakeLabel(status_panel_, "Cấp thuốc: ĐANG KHÓA", 8, 110,
-                                200, 25, kStatusBlue, font, LV_TEXT_ALIGN_LEFT);
+    status_vending_ = MakeLabel(status_panel_, "Relay: LOW 500 ms", 8, 110, 200, 25, kStatusBlue,
+                                font, LV_TEXT_ALIGN_LEFT);
     status_hint_ = MakeLabel(status_panel_, "Nhấn đúp để quay về", 8, 165, 200, 21,
                              kSkyBlue, font);
     lv_obj_add_flag(status_panel_, LV_OBJ_FLAG_HIDDEN);
@@ -222,7 +222,8 @@ void SmartMediVendDisplay::RefreshStatusPage() {
     }
     if (status_wifi_) lv_label_set_text(status_wifi_, wifi);
     if (status_cloud_) lv_label_set_text(status_cloud_, cloud);
-    if (status_vending_) lv_label_set_text(status_vending_, "Cấp thuốc: ĐANG KHÓA");
+    if (status_vending_)
+        lv_label_set_text(status_vending_, "Relay: LOW 500 ms");
 }
 
 void SmartMediVendDisplay::ToggleStatusPage() {

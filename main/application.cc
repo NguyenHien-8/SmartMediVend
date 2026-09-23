@@ -11,6 +11,9 @@
 #include "system_info.h"
 #include "text_glyph_payload.h"
 #include "websocket_protocol.h"
+#ifdef CONFIG_BOARD_TYPE_SMARTMEDIVEND_S3
+#include "boards/smartmedivend-s3/smv_local_voice.h"
+#endif
 
 #include <driver/gpio.h>
 #include <esp_log.h>
@@ -182,7 +185,11 @@ void Application::Run() {
         MAIN_EVENT_VAD_CHANGE | MAIN_EVENT_CLOCK_TICK | MAIN_EVENT_ERROR |
         MAIN_EVENT_NETWORK_CONNECTED | MAIN_EVENT_NETWORK_DISCONNECTED | MAIN_EVENT_TOGGLE_CHAT |
         MAIN_EVENT_START_LISTENING | MAIN_EVENT_STOP_LISTENING | MAIN_EVENT_ACTIVATION_DONE |
-        MAIN_EVENT_STATE_CHANGED | MAIN_EVENT_PLAYBACK_DRAINED;
+        MAIN_EVENT_STATE_CHANGED | MAIN_EVENT_PLAYBACK_DRAINED
+#ifdef CONFIG_BOARD_TYPE_SMARTMEDIVEND_S3
+        | MAIN_EVENT_SMV_GATE_FAULT
+#endif
+        ;
 
     while (true) {
         auto bits = xEventGroupWaitBits(event_group_, ALL_EVENTS, pdTRUE, pdFALSE, portMAX_DELAY);
@@ -212,9 +219,29 @@ void Application::Run() {
             HandleStateChangedEvent();
         }
 
+#ifdef CONFIG_BOARD_TYPE_SMARTMEDIVEND_S3
+        if (bits & MAIN_EVENT_SMV_GATE_FAULT) {
+            SmvGateFault("Bộ đệm âm thanh đầy hoặc giải mã không kịp. Vui lòng nói lại.");
+        }
+#endif
         if (bits & MAIN_EVENT_PLAYBACK_DRAINED) {
             if (audio_service_.IsPlaybackIdle()) {
                 notify_player_.OnPlaybackDrained();
+#ifdef CONFIG_BOARD_TYPE_SMARTMEDIVEND_S3
+                if (smv_local_playing_ && smv_local_sound_started_) {
+                    smv_local_playing_ = false;
+                    smv_local_sound_started_ = false;
+                    smv_pending_local_item_ = nullptr;
+                    SmvFinishServerReply();
+                } else if (smv_tts_stop_pending_ && !smv_local_playing_ &&
+                           smv_audio_gate_.verdict() ==
+                               smv::AudioPlaybackGate<AudioStreamPacket>::Verdict::Forward &&
+                           smv_speaking_ready_ &&
+                           esp_timer_get_time() >= smv_stop_deadline_us_) {
+                    smv_tts_stop_pending_ = false;
+                    SmvFinishServerReply();
+                }
+#endif
             }
             // Deferred listening start (auto mode): the playback queue has
             // drained, so it is now safe to enable voice processing.
@@ -271,6 +298,29 @@ void Application::Run() {
             }
         }
 
+#ifdef CONFIG_BOARD_TYPE_SMARTMEDIVEND_S3
+        if (bits & MAIN_EVENT_CLOCK_TICK && smv_tts_stop_pending_ &&
+            smv_speaking_ready_ && !smv_local_playing_ &&
+            esp_timer_get_time() >= smv_stop_deadline_us_ &&
+            smv_audio_gate_.verdict() ==
+                smv::AudioPlaybackGate<AudioStreamPacket>::Verdict::Forward &&
+            audio_service_.IsPlaybackIdle()) {
+            smv_tts_stop_pending_ = false;
+            SmvFinishServerReply();
+        }
+        if (bits & MAIN_EVENT_CLOCK_TICK && smv_stt_deadline_us_ > 0 &&
+            esp_timer_get_time() >= smv_stt_deadline_us_) {
+            smv_stt_deadline_us_ = 0;
+            bool unanswered = false;
+            {
+                std::lock_guard<std::mutex> lock(smv_gate_mutex_);
+                unanswered = smv_audio_gate_.verdict() ==
+                             smv::AudioPlaybackGate<AudioStreamPacket>::Verdict::Waiting;
+                if (unanswered) smv_audio_gate_.Fail();
+            }
+            if (unanswered) SmvGateFault("Không nhận được STT đúng hạn. Vui lòng nói lại.");
+        }
+#endif
         if (bits & MAIN_EVENT_CLOCK_TICK) {
             clock_ticks_++;
             auto display = Board::GetInstance().GetDisplay();
@@ -552,9 +602,21 @@ void Application::InitializeProtocol() {
     });
 
     protocol_->OnIncomingAudio([this](std::unique_ptr<AudioStreamPacket> packet) {
+#ifdef CONFIG_BOARD_TYPE_SMARTMEDIVEND_S3
+        std::lock_guard<std::mutex> lock(smv_gate_mutex_);
+        const auto previous = smv_audio_gate_.verdict();
+        smv_audio_gate_.Receive(std::move(packet));
+        if (previous != smv::AudioPlaybackGate<AudioStreamPacket>::Verdict::Fault &&
+            smv_audio_gate_.verdict() ==
+                smv::AudioPlaybackGate<AudioStreamPacket>::Verdict::Fault) {
+            xEventGroupSetBits(event_group_, MAIN_EVENT_SMV_GATE_FAULT);
+        }
+        SmvDrainReplyLocked();
+#else
         if (GetDeviceState() == kDeviceStateSpeaking) {
             audio_service_.PushPacketToDecodeQueue(std::move(packet));
         }
+#endif
     });
 
     protocol_->OnAudioChannelOpened([this, codec, &board]() {
@@ -570,6 +632,9 @@ void Application::InitializeProtocol() {
     protocol_->OnAudioChannelClosed([this, &board]() {
         board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
         Schedule([this]() {
+#ifdef CONFIG_BOARD_TYPE_SMARTMEDIVEND_S3
+            SmvArmTurn();
+#endif
             auto display = Board::GetInstance().GetDisplay();
             display->SetChatMessage("system", "");
             SetDeviceState(kDeviceStateIdle);
@@ -618,16 +683,57 @@ void Application::InitializeProtocol() {
             });
         } else if (strcmp(type->valuestring, "tts") == 0) {
             auto state = cJSON_GetObjectItem(root, "state");
-            if (!cJSON_IsString(state)) {
-                return;
-            }
+            if (!cJSON_IsString(state)) return;
             if (strcmp(state->valuestring, "start") == 0) {
+#ifdef CONFIG_BOARD_TYPE_SMARTMEDIVEND_S3
+                // Arm the compressed-audio buffer in the MQTT callback itself.
+                // UDP can arrive before the scheduled speaking-state update.
+                {
+                    std::lock_guard<std::mutex> lock(smv_gate_mutex_);
+                    smv_audio_gate_.StartTts();
+                }
+#endif
                 Schedule([this]() {
+#ifdef CONFIG_BOARD_TYPE_SMARTMEDIVEND_S3
+                    {
+                        std::lock_guard<std::mutex> lock(smv_gate_mutex_);
+                        if (smv_audio_gate_.verdict() ==
+                                smv::AudioPlaybackGate<AudioStreamPacket>::Verdict::Local ||
+                            smv_audio_gate_.verdict() ==
+                                smv::AudioPlaybackGate<AudioStreamPacket>::Verdict::Fault) return;
+                        smv_audio_gate_.StartTts();
+                        if (smv_audio_gate_.verdict() ==
+                            smv::AudioPlaybackGate<AudioStreamPacket>::Verdict::Waiting) {
+                            smv_stt_deadline_us_ = esp_timer_get_time() + 12 * 1000000LL;
+                        }
+                    }
+#endif
                     aborted_ = false;
                     SetDeviceState(kDeviceStateSpeaking);
                 });
             } else if (strcmp(state->valuestring, "stop") == 0) {
                 Schedule([this]() {
+#ifdef CONFIG_BOARD_TYPE_SMARTMEDIVEND_S3
+                    if (smv_local_playing_) return; // Ignore a late server STOP during local audio.
+                    {
+                        std::lock_guard<std::mutex> lock(smv_gate_mutex_);
+                        if (!smv_audio_gate_.started()) return; // Ignore stale STOP before a new TTS.
+                        if (smv_audio_gate_.verdict() ==
+                            smv::AudioPlaybackGate<AudioStreamPacket>::Verdict::Local) return;
+                        if (smv_audio_gate_.verdict() ==
+                            smv::AudioPlaybackGate<AudioStreamPacket>::Verdict::Waiting) {
+                            smv_tts_stop_pending_ = true; // STT can arrive after TTS STOP.
+                            smv_stop_deadline_us_ = esp_timer_get_time() + 300000;
+                            return;
+                        }
+                    }
+                    if (GetDeviceState() == kDeviceStateSpeaking) {
+                        smv_tts_stop_pending_ = true;
+                        // Allow a short network-reordering grace period for UDP
+                        // audio to arrive after the MQTT STOP control message.
+                        smv_stop_deadline_us_ = esp_timer_get_time() + 300000;
+                    }
+#else
                     if (GetDeviceState() == kDeviceStateSpeaking) {
                         if (listening_mode_ == kListeningModeManualStop) {
                             SetDeviceState(kDeviceStateIdle);
@@ -635,20 +741,33 @@ void Application::InitializeProtocol() {
                             SetDeviceState(kDeviceStateListening);
                         }
                     }
+#endif
                 });
             } else if (strcmp(state->valuestring, "sentence_start") == 0) {
                 auto text = cJSON_GetObjectItem(root, "text");
                 if (cJSON_IsString(text)) {
                     std::vector<TextGlyph> glyphs;
                     uint8_t bpp = 0;
-                    if (!TextGlyphPayload::Parse(root, glyphs, bpp)) {
-                        glyphs.clear();
-                    }
+                    if (!TextGlyphPayload::Parse(root, glyphs, bpp)) glyphs.clear();
                     ESP_LOGI(TAG, "<< %s", text->valuestring);
-                    Schedule([display, message = std::string(text->valuestring),
-                              glyphs = std::move(glyphs), bpp]() {
-                        display->AddTextGlyphs(glyphs, bpp);
-                        display->SetChatMessage("assistant", message.c_str());
+                    Schedule([this, display, message = std::string(text->valuestring),
+                              glyphs = std::move(glyphs), bpp]() mutable {
+                        auto update = [display, message = std::move(message),
+                                       glyphs = std::move(glyphs), bpp]() {
+                            display->AddTextGlyphs(glyphs, bpp);
+                            display->SetChatMessage("assistant", message.c_str());
+                        };
+#ifdef CONFIG_BOARD_TYPE_SMARTMEDIVEND_S3
+                        const auto decision = smv_audio_gate_.verdict();
+                        if (decision == smv::AudioPlaybackGate<AudioStreamPacket>::Verdict::Waiting) {
+                            if (smv_pending_sentence_ui_.size() < 4)
+                                smv_pending_sentence_ui_.push_back(std::move(update));
+                            return;
+                        }
+                        if (decision != smv::AudioPlaybackGate<AudioStreamPacket>::Verdict::Forward)
+                            return;
+#endif
+                        update();
                     });
                 }
             }
@@ -657,14 +776,58 @@ void Application::InitializeProtocol() {
             if (cJSON_IsString(text)) {
                 std::vector<TextGlyph> glyphs;
                 uint8_t bpp = 0;
-                if (!TextGlyphPayload::Parse(root, glyphs, bpp)) {
-                    glyphs.clear();
-                }
+                if (!TextGlyphPayload::Parse(root, glyphs, bpp)) glyphs.clear();
                 ESP_LOGI(TAG, ">> %s", text->valuestring);
-                Schedule([display, message = std::string(text->valuestring),
-                          glyphs = std::move(glyphs), bpp]() {
+                Schedule([this, display, message = std::string(text->valuestring),
+                          glyphs = std::move(glyphs), bpp]() mutable {
                     display->AddTextGlyphs(glyphs, bpp);
                     display->SetChatMessage("user", message.c_str());
+#ifdef CONFIG_BOARD_TYPE_SMARTMEDIVEND_S3
+                    const auto match = smv::MatchTestKeyword(message);
+                    const bool local = match.item != nullptr && !match.ambiguous;
+                    {
+                        std::lock_guard<std::mutex> lock(smv_gate_mutex_);
+                        if (smv_audio_gate_.verdict() !=
+                            smv::AudioPlaybackGate<AudioStreamPacket>::Verdict::Waiting) return;
+                        smv_audio_gate_.Decide(local);
+                        if (!local) SmvDrainReplyLocked();
+                    }
+                    smv_stt_deadline_us_ = 0;
+                    if (local) {
+                        smv_pending_sentence_ui_.clear();
+                        smv_pending_local_item_ = match.item;
+                        smv_local_playing_ = true;
+                        smv_local_sound_started_ = false;
+                        smv_tts_stop_pending_ = false;
+                        const bool relay_started =
+                            Board::GetInstance().PulseRelay(match.item->relay);
+                        auto note =
+                            "C" + std::to_string(match.item->relay) + " | " +
+                            std::string(match.item->sku) +
+                            (relay_started ? " | RELAY: XUNG 500 ms" : " | RELAY: BẬN / LỖI");
+                        display->SetChatMessage("assistant", note.c_str());
+                        AbortSpeaking(kAbortReasonNone);
+                        if (GetDeviceState() != kDeviceStateSpeaking) {
+                            smv_speaking_ready_ = false;
+                            SetDeviceState(kDeviceStateSpeaking);
+                        } else if (smv_speaking_ready_) {
+                            audio_service_.ResetDecoder();
+                            SmvBeginLocalSound();
+                        }
+                    } else {
+                        while (!smv_pending_sentence_ui_.empty()) {
+                            auto update = std::move(smv_pending_sentence_ui_.front());
+                            smv_pending_sentence_ui_.pop_front();
+                            update();
+                        }
+                        if (smv_tts_stop_pending_ && smv_speaking_ready_ &&
+                            esp_timer_get_time() >= smv_stop_deadline_us_ &&
+                            audio_service_.IsPlaybackIdle()) {
+                            smv_tts_stop_pending_ = false;
+                            SmvFinishServerReply();
+                        }
+                    }
+#endif
                 });
             }
         } else if (strcmp(type->valuestring, "llm") == 0) {
@@ -1052,6 +1215,22 @@ void Application::HandleStateChangedEvent() {
                 audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());
             }
             audio_service_.ResetDecoder();
+#ifdef CONFIG_BOARD_TYPE_SMARTMEDIVEND_S3
+            smv_speaking_ready_ = true;
+            if (smv_local_playing_) {
+                SmvBeginLocalSound();
+            } else {
+                std::lock_guard<std::mutex> lock(smv_gate_mutex_);
+                smv_audio_gate_.Ready();
+                SmvDrainReplyLocked();
+            }
+            if (smv_tts_stop_pending_ &&
+                esp_timer_get_time() >= smv_stop_deadline_us_ &&
+                audio_service_.IsPlaybackIdle()) {
+                smv_tts_stop_pending_ = false;
+                SmvFinishServerReply();
+            }
+#endif
             break;
         case kDeviceStateNotifying:
             display->SetStatus(Lang::Strings::SPEAKING);
@@ -1076,6 +1255,9 @@ void Application::StartListeningAudio() {
     }
 
     // Send the start listening command
+#ifdef CONFIG_BOARD_TYPE_SMARTMEDIVEND_S3
+    SmvArmTurn(); // New speech turn; reject late packets from previous response.
+#endif
     protocol_->SendStartListening(listening_mode_);
     audio_service_.EnableVoiceProcessing(true);
 
@@ -1163,6 +1345,78 @@ void Application::HandleNotificationFinished(uint32_t playback_id, bool success)
              success ? "completed" : "failed");
     StopNotification();
 }
+
+#ifdef CONFIG_BOARD_TYPE_SMARTMEDIVEND_S3
+void Application::SmvArmTurn() {
+    std::lock_guard<std::mutex> lock(smv_gate_mutex_);
+    smv_audio_gate_.Arm();
+    smv_pending_sentence_ui_.clear();
+    smv_pending_local_item_ = nullptr;
+    smv_local_playing_ = false;
+    smv_local_sound_started_ = false;
+    smv_speaking_ready_ = false;
+    smv_tts_stop_pending_ = false;
+    smv_stt_deadline_us_ = 0;
+    smv_stop_deadline_us_ = 0;
+}
+
+void Application::SmvDrainReplyLocked() {
+    while (auto packet = smv_audio_gate_.PopReady()) {
+        // No waiting in MQTT/UDP callbacks: the receiver's transport task must
+        // not be blocked by an audio consumer that has stalled.
+        if (!audio_service_.PushPacketToDecodeQueue(std::move(packet), false)) {
+            smv_audio_gate_.Fail();
+            xEventGroupSetBits(event_group_, MAIN_EVENT_SMV_GATE_FAULT);
+            return;
+        }
+    }
+}
+
+void Application::SmvBeginLocalSound() {
+    if (!smv_local_playing_ || smv_local_sound_started_ || !smv_pending_local_item_) return;
+    const auto sound = smv::LocalSound(smv_pending_local_item_->relay);
+    if (sound.bytes.empty()) {
+        SmvGateFault("Không tìm thấy âm thanh nội bộ.");
+        return;
+    }
+    // MP3 is decoded locally; untouched slots retain the existing Ogg/Opus path.
+    if (sound.format == smv::LocalVoiceFormat::Mp3) {
+        if (!audio_service_.PlayMp3(sound.bytes)) {
+            SmvGateFault("Không phát được MP3 nội bộ; kiểm tra log bộ giải mã.");
+            return;
+        }
+    } else {
+        audio_service_.PlaySound(sound.bytes);
+    }
+    smv_local_sound_started_ = true;
+}
+
+void Application::SmvFinishServerReply() {
+    if (GetDeviceState() != kDeviceStateSpeaking) return;
+    if (listening_mode_ == kListeningModeManualStop) {
+        SetDeviceState(kDeviceStateIdle);
+    } else {
+        SetDeviceState(kDeviceStateListening);
+    }
+}
+
+void Application::SmvGateFault(const char* reason) {
+    smv_stt_deadline_us_ = 0;
+    smv_stop_deadline_us_ = 0;
+    smv_tts_stop_pending_ = false;
+    smv_local_playing_ = false;
+    smv_local_sound_started_ = false;
+    smv_pending_sentence_ui_.clear();
+    {
+        std::lock_guard<std::mutex> lock(smv_gate_mutex_);
+        smv_audio_gate_.Fail();
+    }
+    audio_service_.ResetDecoder();
+    AbortSpeaking(kAbortReasonNone);
+    Board::GetInstance().GetDisplay()->SetChatMessage("assistant", reason);
+    SmvFinishServerReply();
+}
+#endif
 
 void Application::Schedule(std::function<void()>&& callback) {
     {

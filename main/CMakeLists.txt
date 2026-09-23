@@ -1037,6 +1037,26 @@ if(NOT LANG_DIR STREQUAL "en-US")
 endif()
 
 file(GLOB COMMON_SOUNDS ${CMAKE_CURRENT_SOURCE_DIR}/assets/common/*.ogg)
+if(CONFIG_BOARD_TYPE_SMARTMEDIVEND_S3)
+    # Slot selection: MP3 > original Ogg/Opus. WAV is ignored. Embed only the
+    # selected format for each slot so unused voice assets do not fill flash.
+    set(SMV_VOICE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/boards/smartmedivend-s3/voice")
+    file(GLOB SMV_AUDIO_WATCH CONFIGURE_DEPENDS
+        "${SMV_VOICE_DIR}/*.ogg" "${SMV_VOICE_DIR}/*.mp3")
+    set(SMV_VOICE_DEFINITIONS "")
+    foreach(SMV_NUM IN ITEMS 01 02 03 04 05 06 07 08 09 10 11 12 13 14 15 16)
+        set(SMV_NAME "smv_${SMV_NUM}")
+        if(EXISTS "${SMV_VOICE_DIR}/${SMV_NAME}.mp3")
+            list(APPEND COMMON_SOUNDS "${SMV_VOICE_DIR}/${SMV_NAME}.mp3")
+            list(APPEND SMV_VOICE_DEFINITIONS "SMV_LOCAL_MP3_${SMV_NUM}=1")
+            message(STATUS "SmartMediVend: MP3 voice slot ${SMV_NUM}")
+        elseif(EXISTS "${SMV_VOICE_DIR}/${SMV_NAME}.ogg")
+            list(APPEND COMMON_SOUNDS "${SMV_VOICE_DIR}/${SMV_NAME}.ogg")
+        else()
+            message(FATAL_ERROR "SmartMediVend: missing voice asset ${SMV_NAME} (mp3/ogg; WAV is not supported)")
+        endif()
+    endforeach()
+endif()
 
 # If target chip is ESP32, exclude specific files to avoid build errors
 if(CONFIG_IDF_TARGET_ESP32)
@@ -1121,6 +1141,10 @@ idf_component_register(SRCS ${SOURCES}
                         xiaozhi-fonts
                         ${MAIN_PRIV_REQUIRES_EXTRA}
                     )
+
+if(CONFIG_BOARD_TYPE_SMARTMEDIVEND_S3 AND SMV_VOICE_DEFINITIONS)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE ${SMV_VOICE_DEFINITIONS})
+endif()
 
 # Keep project-owned C++ on GNU C++23. ESP-IDF 6 may default to a newer
 # dialect; pin the baseline so main/ does not depend on it.

@@ -15,6 +15,9 @@
 #include "esp_ae_rate_cvt.h"
 #include "esp_audio_enc.h"
 #include "esp_audio_types.h"
+#ifdef CONFIG_BOARD_TYPE_SMARTMEDIVEND_S3
+#include "esp_audio_simple_dec.h"
+#endif
 #include "esp_opus_dec.h"
 #include "esp_opus_enc.h"
 
@@ -144,6 +147,12 @@ public:
     bool PushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket> packet, bool wait = false);
     std::unique_ptr<AudioStreamPacket> PopPacketFromSendQueue();
     void PlaySound(const std::string_view& sound);
+    // Plays an embedded RIFF/WAVE file directly as PCM over the normal I2S output.
+    // Returns false for unsupported/malformed WAV or a stopped/mismatched codec.
+#ifdef CONFIG_BOARD_TYPE_SMARTMEDIVEND_S3
+    // Stream a linked MP3 asset through the existing paced PCM/I2S queue.
+    bool PlayMp3(const std::string_view& mp3);
+#endif
     bool ReadAudioData(std::vector<int16_t>& data, int sample_rate, int samples);
     void ResetDecoder();
     void SetModelsList(srmodel_list_t* models_list);
@@ -194,6 +203,19 @@ private:
     bool output_in_flight_ = false;
     bool playback_drained_notified_ = true;
     uint32_t playback_generation_ = 0;
+    // Protected by audio_queue_mutex_. The embedded asset outlives playback.
+#ifdef CONFIG_BOARD_TYPE_SMARTMEDIVEND_S3
+    // Protected by audio_queue_mutex_. Only the codec task invokes the MP3
+    // decoder; ResetDecoder / Stop close it under the same mutex.
+    const uint8_t* mp3_ptr_ = nullptr;
+    size_t mp3_remaining_ = 0;
+    bool mp3_active_ = false;
+    bool mp3_supported_ = false;
+    unsigned mp3_stall_count_ = 0;
+    uint32_t mp3_source_rate_ = 0;
+    esp_ae_rate_cvt_handle_t mp3_resampler_ = nullptr;
+    esp_audio_simple_dec_handle_t mp3_decoder_ = nullptr;
+#endif
     // For server AEC
     FixedQueue<uint32_t, MAX_TIMESTAMPS_IN_QUEUE> timestamp_queue_;
 

@@ -73,6 +73,12 @@ public:
     virtual bool GetTemperature(float& esp32temp);
     virtual Display* GetDisplay();
     virtual Camera* GetCamera();
+    // Optional actuator capability. Start one nonblocking pulse using the board's
+    // configured duration/polarity. False means unavailable, busy, or failed.
+    virtual bool PulseRelay(unsigned relay) {
+        (void)relay;
+        return false;
+    }
     virtual NetworkInterface* GetNetwork() = 0;
     virtual void StartNetwork() = 0;
     virtual void SetNetworkEventCallback(NetworkEventCallback callback) { (void)callback; }

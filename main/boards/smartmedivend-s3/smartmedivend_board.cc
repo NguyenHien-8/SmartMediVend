@@ -4,6 +4,7 @@
 #include "config.h"
 #include "smartmedivend_display.h"
 #include "smartmedivend_pcm.h"
+#include "smv_relay.h"
 #include "wifi_board.h"
 
 #include <driver/gpio.h>
@@ -21,7 +22,7 @@
 #include <vector>
 
 namespace {
-// Keep the supplied GPIO map unchanged; none of the vending/MUX GPIOs are driven.
+// Keep the supplied GPIO map unchanged, including the relay MUX pins.
 constexpr int kActivePins[] = {
     smv::pins::TFT_CS, smv::pins::TFT_RST, smv::pins::TFT_DC,
     smv::pins::TFT_MOSI, smv::pins::TFT_SCLK, smv::pins::TFT_BACKLIGHT,
@@ -118,13 +119,15 @@ private:
     uint32_t peak_level_ = 0;
 };
 
-// Voice-only board: the supplied archive omits all medical/relay/stock modules.
-// Do not invent dispensing behavior or energize actuator GPIOs to work around
-// missing dependencies. The on-screen vending status remains LOCKED.
+// Hardware-specific relay polarity, channel mapping and timing stay in this board.
 class SmartMediVendBoard final : public WifiBoard {
 public:
     SmartMediVendBoard()
         : talk_button_(BOOT_BUTTON_GPIO, SMARTMEDIVEND_BUTTON_ACTIVE_HIGH, 2000, 35) {
+        const auto relay_error = smv::MuxRelay::GetInstance().Initialize();
+        if (relay_error != ESP_OK) {
+            ESP_LOGE(kTag, "Relay unavailable: %s", esp_err_to_name(relay_error));
+        }
         InitializeSpiAndPanel();
         InitializeButton();
         GetBacklight()->RestoreBrightness();
@@ -141,6 +144,8 @@ public:
     }
 
     Display* GetDisplay() override { return display_; }
+
+    bool PulseRelay(unsigned relay) override { return smv::MuxRelay::GetInstance().Pulse(relay); }
 
     Backlight* GetBacklight() override {
         static PwmBacklight backlight(DISPLAY_BACKLIGHT_PIN, DISPLAY_BACKLIGHT_OUTPUT_INVERT);
@@ -214,8 +219,7 @@ private:
         display_ = new SmartMediVendDisplay(io, panel, DISPLAY_WIDTH, DISPLAY_HEIGHT,
                                             DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y,
                                             DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
-        ESP_LOGI(kTag, "ST7789 portrait %dx%d; voice-only; dispensing disabled",
-                 DISPLAY_WIDTH, DISPLAY_HEIGHT);
+        ESP_LOGI(kTag, "ST7789 portrait %dx%d", DISPLAY_WIDTH, DISPLAY_HEIGHT);
     }
 };
 

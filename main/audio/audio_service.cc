@@ -1,6 +1,13 @@
 #include "audio_service.h"
 #include <esp_log.h>
+#include <algorithm>
 #include <cstring>
+#ifdef CONFIG_BOARD_TYPE_SMARTMEDIVEND_S3
+#include "boards/smartmedivend-s3/smv_mp3_format.h"
+#include "boards/smartmedivend-s3/smv_local_mp3_level.h"
+#include "esp_audio_simple_dec_default.h"
+#include "esp_audio_dec_default.h"
+#endif
 
 #define RATE_CVT_CFG(_src_rate, _dest_rate, _channel)                                        \
     (esp_ae_rate_cvt_cfg_t) {                                                                \
@@ -48,6 +55,31 @@ AudioService::~AudioService() {
 void AudioService::Initialize(AudioCodec* codec) {
     codec_ = codec;
     codec_->Start();
+
+#ifdef CONFIG_BOARD_TYPE_SMARTMEDIVEND_S3
+    // The simple decoder is an adapter and cannot decode MP3 until the
+    // underlying MPEG Layer III decoder has been registered separately.
+    // The previous implementation registered only the adapter: decoder=no.
+#if !defined(CONFIG_AUDIO_DECODER_MP3_SUPPORT)
+#error "SmartMediVend needs CONFIG_AUDIO_DECODER_MP3_SUPPORT=y in ESP-IDF sdkconfig"
+#endif
+    if (esp_audio_simple_check_audio_type(ESP_AUDIO_SIMPLE_DEC_TYPE_MP3) != ESP_AUDIO_ERR_OK) {
+        const auto codec_status = esp_mp3_dec_register();
+        if (codec_status != ESP_AUDIO_ERR_OK) {
+            ESP_LOGW(TAG, "MP3 codec registration returned %d", static_cast<int>(codec_status));
+        }
+        const auto simple_status = esp_audio_simple_dec_register_default();
+        if (simple_status != ESP_AUDIO_ERR_OK) {
+            ESP_LOGW(TAG, "MP3 simple decoder registration returned %d", static_cast<int>(simple_status));
+        }
+    }
+    mp3_supported_ = esp_audio_simple_check_audio_type(ESP_AUDIO_SIMPLE_DEC_TYPE_MP3) == ESP_AUDIO_ERR_OK;
+    if (!mp3_supported_) {
+        ESP_LOGE(TAG, "Local MP3 decoder unavailable after registering core and simple decoder; check CONFIG_AUDIO_DECODER_MP3_SUPPORT");
+    }
+    ESP_LOGI(TAG, "Local MP3: decoder=%s, speaker=%d Hz", mp3_supported_ ? "available" : "unavailable",
+             codec_->output_sample_rate());
+#endif
 
     esp_opus_dec_cfg_t opus_dec_cfg =
         OPUS_DEC_CFG(codec->output_sample_rate(), OPUS_FRAME_DURATION_MS);
@@ -180,6 +212,21 @@ void AudioService::Stop() {
     {
         std::lock_guard<std::mutex> lock(audio_queue_mutex_);
         ++playback_generation_;
+#ifdef CONFIG_BOARD_TYPE_SMARTMEDIVEND_S3
+        mp3_active_ = false;
+        mp3_ptr_ = nullptr;
+        mp3_remaining_ = 0;
+        mp3_stall_count_ = 0;
+        if (mp3_decoder_ != nullptr) {
+            esp_audio_simple_dec_close(mp3_decoder_);
+            mp3_decoder_ = nullptr;
+        }
+        if (mp3_resampler_ != nullptr) {
+            esp_ae_rate_cvt_close(mp3_resampler_);
+            mp3_resampler_ = nullptr;
+        }
+        mp3_source_rate_ = 0;
+#endif
         audio_encode_queue_.clear();
         audio_decode_queue_.clear();
         audio_playback_queue_.clear();
@@ -383,12 +430,121 @@ void AudioService::OpusCodecTask() {
         std::unique_lock<std::mutex> lock(audio_queue_mutex_);
         audio_queue_cv_.wait(lock, [this]() {
             return service_stopped_.load() || !audio_encode_queue_.empty() ||
+#ifdef CONFIG_BOARD_TYPE_SMARTMEDIVEND_S3
+                   (mp3_active_ && audio_playback_queue_.size() < MAX_PLAYBACK_TASKS_IN_QUEUE) ||
+#endif
                    (!audio_decode_queue_.empty() &&
                     audio_playback_queue_.size() < MAX_PLAYBACK_TASKS_IN_QUEUE);
         });
         if (service_stopped_.load()) {
             break;
         }
+
+#ifdef CONFIG_BOARD_TYPE_SMARTMEDIVEND_S3
+        // Decode at most one MP3 frame per pass, never copy the entire clip
+        // into RAM. The existing output task clocks PCM to I2S at 24 kHz.
+        if (mp3_active_ && audio_playback_queue_.size() < MAX_PLAYBACK_TASKS_IN_QUEUE) {
+            if (mp3_decoder_ == nullptr) {
+                esp_audio_simple_dec_cfg_t cfg = {};
+                cfg.dec_type = ESP_AUDIO_SIMPLE_DEC_TYPE_MP3;
+                cfg.use_frame_dec = false;  // Feed original byte stream, not MP3 frames.
+                const auto err = esp_audio_simple_dec_open(&cfg, &mp3_decoder_);
+                if (err != ESP_AUDIO_ERR_OK || mp3_decoder_ == nullptr) {
+                    ESP_LOGE(TAG, "Cannot open local MP3 decoder: %d", static_cast<int>(err));
+                    mp3_active_ = false;
+                }
+            }
+            if (mp3_active_) {
+                constexpr size_t kMp3InputChunk = 1024;
+                constexpr size_t kMaxMp3OutputBytes = 8192;  // >= one decoded mono MP3 frame.
+                const auto take = std::min(mp3_remaining_, kMp3InputChunk);
+                esp_audio_simple_dec_raw_t raw = {};
+                raw.buffer = const_cast<uint8_t*>(mp3_ptr_);
+                raw.len = static_cast<uint32_t>(take);
+                raw.eos = (take == mp3_remaining_);
+                AudioTask task;
+                task.type = kAudioTaskTypeDecodeToPlaybackQueue;
+                task.pcm.resize(kMaxMp3OutputBytes / sizeof(int16_t));
+                esp_audio_simple_dec_out_t out = {};
+                out.buffer = reinterpret_cast<uint8_t*>(task.pcm.data());
+                out.len = static_cast<uint32_t>(kMaxMp3OutputBytes);
+                const auto err = esp_audio_simple_dec_process(mp3_decoder_, &raw, &out);
+                if (err != ESP_AUDIO_ERR_OK || raw.consumed > take ||
+                    out.decoded_size > out.len || (out.decoded_size & 1)) {
+                    ESP_LOGE(TAG, "Local MP3 decode failed: %d", static_cast<int>(err));
+                    mp3_active_ = false;
+                } else {
+                    mp3_ptr_ += raw.consumed;
+                    mp3_remaining_ -= raw.consumed;
+                    if (out.decoded_size != 0) {
+                        esp_audio_simple_dec_info_t info = {};
+                        if (esp_audio_simple_dec_get_info(mp3_decoder_, &info) != ESP_AUDIO_ERR_OK ||
+                            info.sample_rate != mp3_source_rate_ || info.channel != 1 ||
+                            info.bits_per_sample != 16) {
+                            ESP_LOGE(TAG, "Local MP3 PCM format changed (rate=%lu channels=%u bits=%u)",
+                                static_cast<unsigned long>(info.sample_rate),
+                                static_cast<unsigned>(info.channel), static_cast<unsigned>(info.bits_per_sample));
+                            mp3_active_ = false;
+                        } else {
+                            task.pcm.resize(out.decoded_size / sizeof(int16_t));
+                            if (mp3_resampler_ != nullptr) {
+                                uint32_t max_output = 0;
+                                const auto capacity_result = esp_ae_rate_cvt_get_max_out_sample_num(
+                                    mp3_resampler_, static_cast<uint32_t>(task.pcm.size()), &max_output);
+                                if (capacity_result != ESP_OK || max_output == 0) {
+                                    ESP_LOGE(TAG, "Local MP3 resampler output size failed: %d", (int)capacity_result);
+                                    mp3_active_ = false;
+                                } else {
+                                    std::vector<int16_t> resampled(max_output);
+                                    uint32_t actual_output = max_output;
+                                    const auto convert_result = esp_ae_rate_cvt_process(
+                                        mp3_resampler_, (esp_ae_sample_t)task.pcm.data(),
+                                        static_cast<uint32_t>(task.pcm.size()),
+                                        (esp_ae_sample_t)resampled.data(), &actual_output);
+                                    if (convert_result != ESP_OK || actual_output > max_output) {
+                                        ESP_LOGE(TAG, "Local MP3 resampling failed: %d", (int)convert_result);
+                                        mp3_active_ = false;
+                                    } else {
+                                        resampled.resize(actual_output);
+                                        task.pcm = std::move(resampled);
+                                    }
+                                }
+                            }
+                            if (mp3_active_ && !task.pcm.empty()) {
+                                // Local MP3 only: apply a fixed, bounded speech boost AFTER
+                                // sample-rate conversion and BEFORE the shared output volume.
+                                // No dynamic gain state: repeated frames cannot fade away.
+                                smv::BoostLocalMp3Pcm(task.pcm.data(), task.pcm.size());
+                                audio_playback_queue_.push_back(std::move(task));
+                                audio_queue_cv_.notify_all();
+                            }
+                        }
+                    }
+                    // Allow the decoder to flush buffered frames at EOS, but
+                    // stop on a non-progressing parser or malformed tail.
+                    if (raw.consumed == 0 && out.decoded_size == 0) {
+                        if (mp3_remaining_ == 0 || ++mp3_stall_count_ > 2) mp3_active_ = false;
+                    } else {
+                        mp3_stall_count_ = 0;
+                    }
+                }
+            }
+            if (!mp3_active_) {
+                mp3_ptr_ = nullptr;
+                mp3_remaining_ = 0;
+                if (mp3_decoder_ != nullptr) {
+                    esp_audio_simple_dec_close(mp3_decoder_);
+                    mp3_decoder_ = nullptr;
+                }
+                if (mp3_resampler_ != nullptr) {
+                    esp_ae_rate_cvt_close(mp3_resampler_);
+                    mp3_resampler_ = nullptr;
+                }
+                mp3_source_rate_ = 0;
+                audio_queue_cv_.notify_all();
+            }
+        }
+#endif
 
         /* Decode the audio from decode queue */
         if (!audio_decode_queue_.empty() &&
@@ -785,6 +941,58 @@ void AudioService::PlaySound(const std::string_view& ogg) {
     demuxer->Process(buf, size);
 }
 
+#ifdef CONFIG_BOARD_TYPE_SMARTMEDIVEND_S3
+bool AudioService::PlayMp3(const std::string_view& mp3) {
+    size_t first_frame_offset = 0;
+    const uint32_t source_rate = smv::Mp3MonoSampleRate(mp3, &first_frame_offset);
+    if (!mp3_supported_ || !codec_ || codec_->output_sample_rate() != 24000 || source_rate == 0) {
+        ESP_LOGE(TAG, "Local MP3 rejected: source_rate=%lu, decoder=%s, output_rate=%d; "
+                 "supported MP3: 24000/44100 Hz mono",
+                 static_cast<unsigned long>(source_rate), mp3_supported_ ? "yes" : "no",
+                 codec_ ? codec_->output_sample_rate() : 0);
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+    if (service_stopped_.load()) return false;
+    ++playback_generation_;
+    audio_decode_queue_.clear();
+    audio_playback_queue_.clear();
+    if (mp3_decoder_ != nullptr) {
+        esp_audio_simple_dec_close(mp3_decoder_);
+        mp3_decoder_ = nullptr;
+    }
+    if (mp3_resampler_ != nullptr) {
+        esp_ae_rate_cvt_close(mp3_resampler_);
+        mp3_resampler_ = nullptr;
+    }
+    mp3_source_rate_ = 0;
+    // Use the audio effects component already linked by the project; do not
+    // change the hardware I2S sample rate or the Xiaozhi server audio path.
+    if (source_rate != 24000) {
+        esp_ae_rate_cvt_cfg_t resample_cfg = RATE_CVT_CFG(source_rate, 24000, ESP_AUDIO_MONO);
+        const auto status = esp_ae_rate_cvt_open(&resample_cfg, &mp3_resampler_);
+        if (status != ESP_OK || mp3_resampler_ == nullptr) {
+            ESP_LOGE(TAG, "Local MP3 %lu->24000 resampler unavailable: %d",
+                     static_cast<unsigned long>(source_rate), (int)status);
+            mp3_resampler_ = nullptr;
+            return false;
+        }
+    }
+    mp3_source_rate_ = source_rate;
+    ESP_LOGI(TAG, "Local MP3 playback: %lu Hz mono -> 24000 Hz speaker, volume=%d/100, "
+             "local speech boost enabled (+5.1 dB with soft limiting)",
+             static_cast<unsigned long>(source_rate), codec_->output_volume());
+    // The MP3 decoder receives raw MPEG frames, not the optional ID3 tag.
+    mp3_ptr_ = reinterpret_cast<const uint8_t*>(mp3.data()) + first_frame_offset;
+    mp3_remaining_ = mp3.size() - first_frame_offset;
+    mp3_stall_count_ = 0;
+    mp3_active_ = true;
+    playback_drained_notified_ = false;
+    audio_queue_cv_.notify_all();
+    return true;
+}
+#endif
+
 bool AudioService::IsIdle() {
     std::lock_guard<std::mutex> lock(audio_queue_mutex_);
     return audio_encode_queue_.empty() && IsPlaybackDrainedLocked() && audio_testing_queue_.empty();
@@ -800,6 +1008,21 @@ void AudioService::ResetDecoder() {
     {
         std::lock_guard<std::mutex> lock(audio_queue_mutex_);
         ++playback_generation_;
+#ifdef CONFIG_BOARD_TYPE_SMARTMEDIVEND_S3
+        mp3_active_ = false;
+        mp3_ptr_ = nullptr;
+        mp3_remaining_ = 0;
+        mp3_stall_count_ = 0;
+        if (mp3_decoder_ != nullptr) {
+            esp_audio_simple_dec_close(mp3_decoder_);
+            mp3_decoder_ = nullptr;
+        }
+        if (mp3_resampler_ != nullptr) {
+            esp_ae_rate_cvt_close(mp3_resampler_);
+            mp3_resampler_ = nullptr;
+        }
+        mp3_source_rate_ = 0;
+#endif
         std::unique_lock<std::mutex> decoder_lock(decoder_mutex_);
         if (opus_decoder_ != nullptr) {
             esp_opus_dec_reset(opus_decoder_);
@@ -818,8 +1041,11 @@ void AudioService::ResetDecoder() {
 }
 
 bool AudioService::IsPlaybackDrainedLocked() const {
-    return audio_decode_queue_.empty() && audio_playback_queue_.empty() && !decode_in_flight_ &&
-           !output_in_flight_;
+#ifdef CONFIG_BOARD_TYPE_SMARTMEDIVEND_S3
+    if (mp3_active_) return false;
+#endif
+    return audio_decode_queue_.empty() && audio_playback_queue_.empty() &&
+           !decode_in_flight_ && !output_in_flight_;
 }
 
 bool AudioService::MarkPlaybackDrainedLocked() {

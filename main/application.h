@@ -20,6 +20,10 @@
 #include "device_state.h"
 #include "device_state_machine.h"
 #include "notify/notify_player.h"
+#ifdef CONFIG_BOARD_TYPE_SMARTMEDIVEND_S3
+#include "boards/smartmedivend-s3/smv_audio_playback_gate.h"
+#include "boards/smartmedivend-s3/smv_keyword_matcher.h"
+#endif
 
 // Main event bits
 #define MAIN_EVENT_SCHEDULE             (1 << 0)
@@ -36,6 +40,9 @@
 #define MAIN_EVENT_STOP_LISTENING       (1 << 11)
 #define MAIN_EVENT_STATE_CHANGED        (1 << 12)
 #define MAIN_EVENT_PLAYBACK_DRAINED     (1 << 13)
+#ifdef CONFIG_BOARD_TYPE_SMARTMEDIVEND_S3
+#define MAIN_EVENT_SMV_GATE_FAULT       (1 << 14)
+#endif
 
 
 enum AecMode {
@@ -142,6 +149,25 @@ private:
     AudioService audio_service_;
     NotifyPlayer notify_player_;
     uint32_t notification_playback_id_ = 0;
+#ifdef CONFIG_BOARD_TYPE_SMARTMEDIVEND_S3
+    // The gate protects a single server reply and accepts one STT decision per
+    // turn. Relay GPIO and pulse timing belong to the optional Board capability.
+    std::mutex smv_gate_mutex_;
+    smv::AudioPlaybackGate<AudioStreamPacket> smv_audio_gate_;
+    std::deque<std::function<void()>> smv_pending_sentence_ui_;
+    const smv::TestItem* smv_pending_local_item_ = nullptr;
+    bool smv_local_playing_ = false;
+    bool smv_local_sound_started_ = false;
+    bool smv_speaking_ready_ = false;
+    bool smv_tts_stop_pending_ = false;
+    int64_t smv_stt_deadline_us_ = 0;
+    int64_t smv_stop_deadline_us_ = 0; // UDP may arrive after MQTT tts/stop.
+    void SmvArmTurn();
+    void SmvDrainReplyLocked(); // requires smv_gate_mutex_; never called from an ISR
+    void SmvBeginLocalSound();
+    void SmvFinishServerReply();
+    void SmvGateFault(const char* reason);
+#endif
     std::unique_ptr<Ota> ota_;
 
     std::function<void(const std::string&)> mcp_broadcast_callback_;
